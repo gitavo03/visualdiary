@@ -1,0 +1,326 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, addDoc, onSnapshot, query, serverTimestamp } from 'firebase/firestore';
+import { Camera, Download, Cloud, Loader2, Settings } from 'lucide-react';
+
+// --- KONFIGURASI PENTING ---
+// Masukkan URL Web App Google Apps Script kamu di sini:
+// Contoh: "https://script.google.com/macros/s/AKfycbx.../exec"
+const GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbyN0EMG5ErIANTUlvuJNUqPSoHW0_HAC1VrY-XoJWknHsya71m4i00tFTzLxXtc3e7Z/exec"; 
+
+// --- Firebase Configuration ---
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+// --- Helper: SVG Radar Chart Component ---
+const RadarChart = ({ data, size = 300, labels }) => {
+  const center = size / 2;
+  const radius = (size / 2) - 40; // Padding
+  const maxVal = 10;
+
+  const getPoint = (value, index, total) => {
+    const angle = (Math.PI * 2 * index) / total - (Math.PI / 2);
+    const x = center + (radius * (value / maxVal)) * Math.cos(angle);
+    const y = center + (radius * (value / maxVal)) * Math.sin(angle);
+    return { x, y };
+  };
+
+  const levels = [2, 4, 6, 8, 10];
+  const gridPolygons = levels.map(level => {
+    const points = labels.map((_, i) => {
+      const { x, y } = getPoint(level, i, labels.length);
+      return `${x},${y}`;
+    }).join(' ');
+    return { points, level };
+  });
+
+  const dataPoints = data.map((d, i) => {
+    const { x, y } = getPoint(d, i, data.length);
+    return `${x},${y}`;
+  }).join(' ');
+
+  const labelPoints = labels.map((label, i) => {
+    const angle = (Math.PI * 2 * i) / labels.length - (Math.PI / 2);
+    const x = center + (radius + 25) * Math.cos(angle);
+    const y = center + (radius + 25) * Math.sin(angle);
+    return { x, y, label };
+  });
+
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="mx-auto">
+      {gridPolygons.map((poly, i) => (
+        <polygon key={i} points={poly.points} fill="none" stroke="#e5e7eb" strokeWidth="1" />
+      ))}
+      {labels.map((_, i) => {
+        const { x, y } = getPoint(maxVal, i, labels.length);
+        return <line key={i} x1={center} y1={center} x2={x} y2={y} stroke="#e5e7eb" strokeWidth="1" />;
+      })}
+      <polygon points={dataPoints} fill="rgba(0, 0, 0, 0.2)" stroke="black" strokeWidth="2" />
+      {data.map((d, i) => {
+        const { x, y } = getPoint(d, i, data.length);
+        return <circle key={i} cx={x} cy={y} r="4" fill="black" stroke="white" strokeWidth="2" />;
+      })}
+      {labelPoints.map((pt, i) => (
+        <text key={i} x={pt.x} y={pt.y} textAnchor="middle" dominantBaseline="middle" className="text-xs font-bold fill-gray-600 uppercase tracking-wider">
+          {pt.label}
+        </text>
+      ))}
+    </svg>
+  );
+};
+
+export default function VisualDiaryApp() {
+  const [user, setUser] = useState(null);
+  const [taskName, setTaskName] = useState('');
+  const [scores, setScores] = useState({ harus: 5, mampu: 5, ingin: 5 });
+  const [savedTasks, setSavedTasks] = useState([]);
+  const [isSaving, setIsSaving] = useState(false);
+  const [scriptUrl, setScriptUrl] = useState(GOOGLE_SCRIPT_URL);
+  const [showSettings, setShowSettings] = useState(false);
+  const chartRef = useRef(null);
+
+  // --- Auth & Data Fetching ---
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (error) {
+        console.error("Auth error:", error);
+        // Fallback to anonymous if custom token fails
+        if (!auth.currentUser) await signInAnonymously(auth);
+      }
+    };
+    initAuth();
+    const unsubscribeAuth = onAuthStateChanged(auth, setUser);
+    return () => unsubscribeAuth();
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+    
+    // FETCH DATA TANPA ORDERBY (Sorting dilakukan di JavaScript agar aman dari error permission/index)
+    const q = query(
+      collection(db, 'artifacts', appId, 'public', 'data', 'visual-diary-tasks')
+    );
+
+    const unsubscribeData = onSnapshot(q, (snapshot) => {
+      const tasks = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      
+      // Manual Sorting di Client (Terbaru di atas)
+      tasks.sort((a, b) => {
+        const timeA = a.createdAt?.seconds || 0;
+        const timeB = b.createdAt?.seconds || 0;
+        return timeB - timeA;
+      });
+
+      setSavedTasks(tasks);
+    }, (error) => {
+      console.error("Firestore Error:", error);
+    });
+
+    return () => unsubscribeData();
+  }, [user]);
+
+  const handleSave = async () => {
+    if (!taskName.trim()) {
+      alert("Isi nama tugas dulu ya!");
+      return;
+    }
+    if (!user) return;
+
+    setIsSaving(true);
+
+    try {
+      // 1. Simpan ke Firebase (History App)
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'visual-diary-tasks'), {
+        taskName,
+        scores,
+        createdAt: serverTimestamp(),
+        userId: user.uid
+      });
+
+      // 2. Kirim ke Google Spreadsheet (jika URL diisi)
+      if (scriptUrl) {
+        const dataToSend = { taskName, scores };
+        await fetch(scriptUrl, {
+          method: 'POST',
+          mode: 'no-cors',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(dataToSend)
+        });
+        console.log("Terkirim ke Spreadsheet");
+      }
+
+      setTaskName('');
+      alert("Berhasil disimpan! ☁️");
+    } catch (err) {
+      console.error("Error saving:", err);
+      alert("Gagal menyimpan, cek koneksi.");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleDownload = () => {
+    const svg = chartRef.current.querySelector('svg');
+    if (!svg) return;
+    const svgData = new XMLSerializer().serializeToString(svg);
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    const img = new Image();
+    const svgSize = 300; 
+    canvas.width = svgSize + 40; 
+    canvas.height = svgSize + 100;
+
+    img.onload = () => {
+      ctx.fillStyle = "white";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#333";
+      ctx.font = "bold 20px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(taskName || "Visual Diary", canvas.width / 2, 40);
+      ctx.drawImage(img, 20, 60);
+      const link = document.createElement("a");
+      link.download = `${taskName || 'diagram'}.png`;
+      link.href = canvas.toDataURL("image/png");
+      link.click();
+    };
+    img.src = "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(svgData)));
+  };
+
+  const labels = ['HARUS (Need)', 'MAMPU (Skill)', 'INGIN (Passion)'];
+  const chartData = [scores.harus, scores.mampu, scores.ingin];
+
+  return (
+    <div className="min-h-screen bg-gray-100 p-4 sm:p-6 font-sans flex flex-col items-center">
+      
+      {/* Main Card */}
+      <div className="bg-white rounded-3xl shadow-xl w-full max-w-md overflow-hidden relative">
+        
+        {/* Settings Toggle */}
+        <button 
+          onClick={() => setShowSettings(!showSettings)}
+          className="absolute top-4 right-4 text-white/50 hover:text-white transition-colors z-10"
+        >
+          <Settings className="w-5 h-5" />
+        </button>
+
+        {/* Header */}
+        <div className="bg-black text-white p-6 text-center">
+          <h1 className="text-xl font-bold flex items-center justify-center gap-2">
+            <Camera className="w-6 h-6" />
+            Visual Diary
+          </h1>
+          <p className="text-gray-400 text-sm mt-1">Petakan ide & projectmu</p>
+        </div>
+
+        {/* Settings Panel */}
+        {showSettings && (
+          <div className="bg-gray-50 p-4 border-b border-gray-100 animate-in slide-in-from-top-2">
+            <label className="text-xs font-bold text-gray-500 uppercase block mb-2">
+              Google Apps Script URL (Opsional)
+            </label>
+            <input 
+              type="text" 
+              value={scriptUrl}
+              onChange={(e) => setScriptUrl(e.target.value)}
+              placeholder="https://script.google.com/..."
+              className="w-full text-xs p-2 border rounded"
+            />
+            <p className="text-[10px] text-gray-400 mt-1">
+              Masukkan URL Deployment Web App dari Google Apps Script untuk sinkronisasi ke Spreadsheet.
+            </p>
+          </div>
+        )}
+
+        <div className="p-6">
+          <div className="mb-6">
+            <input
+              type="text"
+              value={taskName}
+              onChange={(e) => setTaskName(e.target.value)}
+              placeholder="Nama Tugas / Projek..."
+              className="w-full px-4 py-3 text-lg border-2 border-gray-200 rounded-xl focus:border-black focus:outline-none transition-colors text-center font-medium placeholder-gray-400"
+            />
+          </div>
+
+          <div ref={chartRef} className="bg-gray-50 rounded-2xl mb-8 py-4">
+            <RadarChart data={chartData} labels={['Need', 'Skill', 'Passion']} size={280} />
+          </div>
+
+          <div className="space-y-6 mb-8">
+            {['harus', 'mampu', 'ingin'].map((key, index) => (
+              <div key={key} className="relative">
+                <div className="flex justify-between mb-2 text-sm font-bold text-gray-700 uppercase">
+                  <label>{labels[index]}</label>
+                  <span className="bg-gray-200 px-2 py-0.5 rounded text-gray-800">{scores[key]}</span>
+                </div>
+                <input
+                  type="range"
+                  min="0"
+                  max="10"
+                  step="1"
+                  value={scores[key]}
+                  onChange={(e) => setScores(p => ({...p, [key]: parseInt(e.target.value)}))}
+                  className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-black"
+                />
+              </div>
+            ))}
+          </div>
+
+          <div className="flex gap-3">
+            <button
+              onClick={handleDownload}
+              className="flex-1 flex items-center justify-center gap-2 py-3 px-4 bg-gray-100 hover:bg-gray-200 text-gray-800 rounded-xl font-bold transition-colors"
+            >
+              <Download className="w-4 h-4" />
+              Gambar
+            </button>
+            <button
+              onClick={handleSave}
+              disabled={isSaving}
+              className="flex-1 flex items-center justify-center gap-2 py-3 px-4 bg-black hover:bg-gray-800 text-white rounded-xl font-bold transition-colors disabled:opacity-50"
+            >
+              {isSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Cloud className="w-4 h-4" />}
+              {isSaving ? 'Menyimpan...' : 'Simpan'}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* History Section */}
+      <div className="w-full max-w-md mt-8 pb-10">
+        <h3 className="text-gray-500 font-bold mb-4 px-2 uppercase text-xs tracking-wider">Riwayat Tersimpan</h3>
+        <div className="space-y-3">
+          {savedTasks.length === 0 ? (
+            <div className="text-center text-gray-400 py-8 bg-white/50 rounded-xl">Belum ada data tersimpan.</div>
+          ) : (
+            savedTasks.map((task) => (
+              <div key={task.id} className="bg-white p-4 rounded-xl shadow-sm flex justify-between items-center border border-gray-100">
+                <div>
+                  <div className="font-bold text-gray-800">{task.taskName}</div>
+                  <div className="text-xs text-gray-500 mt-1 flex gap-2">
+                    <span className="bg-red-50 text-red-600 px-1.5 py-0.5 rounded">N: {task.scores.harus}</span>
+                    <span className="bg-blue-50 text-blue-600 px-1.5 py-0.5 rounded">S: {task.scores.mampu}</span>
+                    <span className="bg-green-50 text-green-600 px-1.5 py-0.5 rounded">P: {task.scores.ingin}</span>
+                  </div>
+                </div>
+                <div className="w-8 h-8 rounded-full bg-gray-50 flex items-center justify-center text-gray-400">
+                   <div className="w-2 h-2 rounded-full bg-black/20"></div>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
